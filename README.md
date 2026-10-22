@@ -158,20 +158,34 @@ Variables are where most Ansible projects become messy. Be disciplined.
 ### Naming
 
 - Use **`snake_case`** only — lowercase letters, numbers and underscores.
-- **Prefix role variables with the role name** to avoid collisions.
+- **Name role variables `role_name__variable_name`**: the role name, a **double underscore**, then the variable name.
 - Use descriptive names; avoid abbreviations.
 
 ```yaml
 # Good
-nginx_worker_processes: 4
-nginx_listen_port: 80
-postgresql_max_connections: 200
+nginx__worker_processes: 4
+nginx__listen_port: 80
+postgresql__max_connections: 200
+web_server__document_root: /var/www/html
 
 # Bad
-port: 80             # Which service?
-WorkerProcs: 4       # Wrong case
-pg_mc: 200           # Unclear abbreviation
+port: 80                        # Which service?
+nginx_listen_port: 80           # Single underscore: where does the role name end?
+WorkerProcs: 4                  # Wrong case
+pg_mc: 200                      # Unclear abbreviation
 ```
+
+**Why the double underscore:** role names and variable names often both contain underscores. With a single underscore you can't tell whether `web_server_document_root` belongs to a `web` role or a `web_server` role. With `web_server__document_root` the split is obvious. It also means:
+
+- You can find every variable for a role with one search (`grep -r 'web_server__'`).
+- Role variables never clash with each other, with other roles, or with Ansible's own variables.
+- When reading a playbook or `group_vars` file, you know straight away which role a value configures.
+
+**Rules:**
+
+- The prefix must match the role's folder name exactly.
+- Use it for **every** variable the role defines or uses: `defaults/`, `vars/`, `register:`, `set_fact`, and loop variables (`loop_control: loop_var:`).
+- Variables that aren't tied to a role (for example shared values in `group_vars/all`) don't take a role prefix.
 
 ### Where to define variables
 
@@ -193,7 +207,7 @@ Ansible has [22 levels of variable precedence](https://docs.ansible.com/ansible/
 - **Never hard-code values** in tasks that might differ between environments.
 - **Quote strings** that could be misinterpreted (`"yes"`, `"no"`, `"on"`, `"0755"`, version numbers like `"1.10"`).
 - Use the `| default()` filter for optional values and `| mandatory` for required ones.
-- Prefix "private" internal variables with `__` (e.g. `__nginx_config_changed`) to signal they aren't part of the public interface.
+- Registered results follow the same format, e.g. `register: nginx__config_result`.
 
 ---
 
@@ -212,7 +226,7 @@ Playbooks should be **thin** — they map hosts to roles and little else.
     - role: common
     - role: nginx
       vars:
-        nginx_listen_port: 8080
+        nginx__listen_port: 8080
 ```
 
 A master playbook ties everything together:
@@ -277,17 +291,17 @@ roles/nginx/
 ```yaml
 # roles/nginx/tasks/main.yml
 ---
-- name: Load OS-specific variables
+- name: main | Load OS-specific variables
   ansible.builtin.include_vars: "{{ item }}"
   with_first_found:
     - "{{ ansible_facts['distribution'] }}-{{ ansible_facts['distribution_major_version'] }}.yml"
     - "{{ ansible_facts['os_family'] }}.yml"
     - default.yml
 
-- name: Install nginx
+- name: main | Install nginx
   ansible.builtin.import_tasks: install.yml
 
-- name: Configure nginx
+- name: main | Configure nginx
   ansible.builtin.import_tasks: configure.yml
 ```
 
@@ -301,11 +315,11 @@ argument_specs:
   main:
     short_description: Install and configure nginx
     options:
-      nginx_listen_port:
+      nginx__listen_port:
         type: int
         default: 80
         description: Port nginx listens on.
-      nginx_server_name:
+      nginx__server_name:
         type: str
         required: true
         description: The primary server name.
@@ -329,6 +343,62 @@ Names should describe the **desired state**, starting with a capital letter.
 # Bad — no name, short-form syntax
 - package: name=nginx state=present
 ```
+
+### Prefix role task names with their file name
+
+In roles, start each task name with the name of the task file it lives in (without `.yml`), then ` | `, then the description:
+
+```yaml
+# roles/webserver/tasks/install_software.yml
+---
+- name: install_software | Install httpd
+  ansible.builtin.package:
+    name: httpd
+    state: present
+
+- name: install_software | Install mod_ssl
+  ansible.builtin.package:
+    name: mod_ssl
+    state: present
+```
+
+```yaml
+# roles/webserver/tasks/main.yml
+---
+- name: main | Install software
+  ansible.builtin.import_tasks: install_software.yml
+
+- name: main | Configure httpd
+  ansible.builtin.import_tasks: configure.yml
+```
+
+When the role runs, the output shows exactly where each task comes from:
+
+```text
+TASK [webserver : install_software | Install httpd] ****************************
+changed: [web01.example.com]
+
+TASK [webserver : configure | Deploy httpd.conf] *******************************
+ok: [web01.example.com]
+```
+
+**Why:** Ansible shows the role name in the output but not the file. In a large role with many task files, the prefix tells you straight away which file to open when a task fails, is slow, or reports an unexpected change. It also makes `--start-at-task` and `--list-tasks` output easier to read.
+
+**Rules:**
+
+- Use the file name exactly as it is (`install_software`, not `Install Software`), so it matches what you'd search for.
+- Use ` | ` (space, pipe, space) as the separator every time.
+- Apply it to every task file in a role, including `main.yml` and any nested folders (e.g. `tasks/os/redhat.yml` → `redhat | ...`).
+- Rename the prefix if you rename or move the file. A wrong prefix is worse than none.
+- Tasks written directly in a playbook (not in a role) don't need a prefix. The play name already gives context.
+
+> **Enforce it with ansible-lint:** the opt-in `name[prefix]` rule checks for this same `<file> | ` format (it skips `main.yml`, so check those in code review):
+>
+> ```yaml
+> # .ansible-lint
+> enable_list:
+>   - name[prefix]
+> ```
 
 ### Use Fully Qualified Collection Names (FQCN)
 
@@ -412,7 +482,7 @@ If you must use `command`/`shell`, make it idempotent:
 # Good
 - name: Ensure required packages are installed
   ansible.builtin.package:
-    name: "{{ common_packages }}"
+    name: "{{ common__packages }}"
     state: present
 
 # Bad
@@ -473,10 +543,10 @@ Idempotency means running the same playbook repeatedly produces the same end sta
 # {{ ansible_managed }}
 # Do not edit manually — changes will be overwritten.
 
-worker_processes {{ nginx_worker_processes }};
+worker_processes {{ nginx__worker_processes }};
 
 events {
-    worker_connections {{ nginx_worker_connections }};
+    worker_connections {{ nginx__worker_connections }};
 }
 ```
 
@@ -484,7 +554,8 @@ events {
 - **Validate configs before deploying** using the `validate` parameter:
 
 ```yaml
-- name: Deploy nginx configuration
+# roles/nginx/tasks/configure.yml
+- name: configure | Deploy nginx configuration
   ansible.builtin.template:
     src: nginx.conf.j2
     dest: /etc/nginx/nginx.conf
@@ -598,19 +669,19 @@ Use `block` / `rescue` / `always` for structured error handling:
   block:
     - name: Deploy new release
       ansible.builtin.unarchive:
-        src: "app-{{ app_version }}.tar.gz"
+        src: "app-{{ app__version }}.tar.gz"
         dest: /opt/app/releases/
 
     - name: Switch symlink to new release
       ansible.builtin.file:
-        src: "/opt/app/releases/{{ app_version }}"
+        src: "/opt/app/releases/{{ app__version }}"
         dest: /opt/app/current
         state: link
 
   rescue:
     - name: Roll back to previous release
       ansible.builtin.file:
-        src: "/opt/app/releases/{{ app_previous_version }}"
+        src: "/opt/app/releases/{{ app__previous_version }}"
         dest: /opt/app/current
         state: link
 
@@ -666,6 +737,8 @@ Untested automation is a liability. Build quality checks into your workflow.
 ```yaml
 ---
 profile: production
+enable_list:
+  - name[prefix]   # Role task names must start with "<task file> | "
 exclude_paths:
   - .cache/
   - collections/
@@ -748,6 +821,7 @@ Use this during code review.
 
 ### Readability
 - [ ] Every play, task, and handler has a descriptive name
+- [ ] Role task names start with their task file name (`install_software | Install httpd`)
 - [ ] Fully Qualified Collection Names (FQCN) used for all modules
 - [ ] Native YAML syntax — no `key=value` shorthand
 - [ ] Consistent 2-space indentation
@@ -756,7 +830,7 @@ Use this during code review.
 
 ### Variables
 - [ ] All variables use `snake_case`
-- [ ] Role variables are prefixed with the role name
+- [ ] Role variables use `role_name__variable_name` (double underscore)
 - [ ] Every role variable has a default in `defaults/main.yml`
 - [ ] No hard-coded environment-specific values
 
