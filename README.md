@@ -14,17 +14,18 @@
 6. [Playbooks](#6-playbooks)
 7. [Roles](#7-roles)
 8. [Tasks](#8-tasks)
-9. [Idempotency](#9-idempotency)
-10. [Templates and Files](#10-templates-and-files)
-11. [Handlers](#11-handlers)
-12. [Secrets Management](#12-secrets-management)
-13. [Collections and Dependencies](#13-collections-and-dependencies)
-14. [Error Handling](#14-error-handling)
-15. [Performance](#15-performance)
-16. [Testing and Linting](#16-testing-and-linting)
-17. [Version Control and CI/CD](#17-version-control-and-cicd)
-18. [Documentation](#18-documentation)
-19. [Quick Reference Checklist](#19-quick-reference-checklist)
+9. [Tags](#9-tags)
+10. [Idempotency](#10-idempotency)
+11. [Templates and Files](#11-templates-and-files)
+12. [Handlers](#12-handlers)
+13. [Secrets Management](#13-secrets-management)
+14. [Collections and Dependencies](#14-collections-and-dependencies)
+15. [Error Handling](#15-error-handling)
+16. [Performance](#16-performance)
+17. [Testing and Linting](#17-testing-and-linting)
+18. [Version Control and CI/CD](#18-version-control-and-cicd)
+19. [Documentation](#19-documentation)
+20. [Quick Reference Checklist](#20-quick-reference-checklist)
 
 ---
 
@@ -247,7 +248,100 @@ A master playbook ties everything together:
 - **Start every YAML file with `---`.**
 - **Set `become` explicitly** at the play or task level — only escalate privileges where required.
 - **Avoid long lists of tasks in playbooks** — move them into a role.
-- Use **tags** to allow partial runs (`--tags nginx`), but apply them consistently and don't over-tag.
+- Use **tags** to allow partial runs (`--tags nginx`). See [Section 9](#9-tags).
+
+### Pre-tasks and post-tasks
+
+`pre_tasks` and `post_tasks` let a play do work **before** and **after** its roles, without putting that work inside a reusable role where it doesn't belong.
+
+**Execution order in a play:**
+
+```text
+1. pre_tasks
+2. handlers notified by pre_tasks
+3. roles
+4. tasks
+5. handlers notified by roles and tasks
+6. post_tasks
+7. handlers notified by post_tasks
+```
+
+> Note the handler flush after `pre_tasks`. A handler notified in `pre_tasks` runs **before** any role starts, which is useful when, for example, a package cache refresh must finish first.
+
+**Good uses for `pre_tasks`:**
+
+- Checking preconditions with `ansible.builtin.assert` (correct OS, enough disk space, required variables set)
+- Taking a host out of a load balancer or monitoring before changing it
+- Waiting for a host to become reachable (`ansible.builtin.wait_for_connection`)
+- Refreshing package caches once, rather than in every role
+
+**Good uses for `post_tasks`:**
+
+- Smoke tests that check the service actually works (`ansible.builtin.uri`)
+- Putting the host back into the load balancer and re-enabling monitoring
+- Sending a notification that the deployment has finished
+
+**Example: rolling update with a load balancer:**
+
+```yaml
+# playbooks/webservers.yml
+---
+- name: Rolling update of web servers
+  hosts: webservers
+  become: true
+  serial: 2
+
+  pre_tasks:
+    - name: Check the host is a supported OS
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "RedHat"
+        fail_msg: "This playbook only supports RedHat-family hosts."
+      tags: always
+
+    - name: Disable host in the load balancer
+      community.general.haproxy:
+        state: disabled
+        host: "{{ inventory_hostname }}"
+        backend: web_backend
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['loadbalancers'] }}"
+      tags: always
+
+  roles:
+    - role: common
+      tags: common
+    - role: nginx
+      tags: nginx
+
+  post_tasks:
+    - name: Check the site responds
+      ansible.builtin.uri:
+        url: "http://{{ inventory_hostname }}/health"
+        status_code: 200
+      register: webservers__health_check
+      retries: 5
+      delay: 5
+      until: webservers__health_check.status == 200
+      tags: always
+
+    - name: Enable host in the load balancer
+      community.general.haproxy:
+        state: enabled
+        host: "{{ inventory_hostname }}"
+        backend: web_backend
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['loadbalancers'] }}"
+      tags: always
+```
+
+**Guidelines:**
+
+- **Keep pre/post tasks short.** They're for play-level setup and teardown. If they grow past a handful of tasks, or you copy them between playbooks, move them into a role (e.g. `lb_drain`) or a shared task file.
+- **Keep host-specific steps out of roles.** A role like `nginx` shouldn't know about your load balancer. Draining and re-enabling the host belongs in the playbook's `pre_tasks` and `post_tasks`, so the role stays reusable.
+- **Tag safety steps with `always`.** If you run `--tags nginx`, untagged pre/post tasks are **skipped**. That means the role would restart nginx while the host is still taking live traffic. Tag load balancer, assert, and health check steps with `always` so they run on every partial run.
+- **Pre/post tasks keep the play's `serial` batching**, so each batch is drained, updated, checked and re-enabled before the next batch starts.
+- Pre/post tasks belong to the playbook, not a role, so they don't need a task file prefix. Their registered variables still use a prefix to avoid clashes (`webservers__health_check` above).
 
 ---
 
@@ -510,7 +604,102 @@ If you must use `command`/`shell`, make it idempotent:
 
 ---
 
-## 9. Idempotency
+## 9. Tags
+
+Tags let you run or skip part of a playbook without editing it, e.g. pushing only a config change rather than running the full build. They're a speed tool. Used carelessly, they make runs unpredictable.
+
+```bash
+ansible-playbook playbooks/site.yml --tags nginx              # Only nginx
+ansible-playbook playbooks/site.yml --tags nginx__configure   # Only nginx config
+ansible-playbook playbooks/site.yml --skip-tags common        # Everything except common
+ansible-playbook playbooks/site.yml --list-tags               # Show every tag
+ansible-playbook playbooks/site.yml --tags nginx --list-tasks # Preview what would run
+```
+
+### A consistent tagging scheme
+
+Use two levels of tags:
+
+| Level | Where applied | Format | Example |
+|---|---|---|---|
+| **Role** | On the role in the playbook | `role_name` | `nginx` |
+| **Task file** | On each `import_tasks` in the role's `tasks/main.yml` | `role_name__task_file` | `nginx__install_software`, `nginx__configure` |
+
+The task file tag uses the same `role_name__` prefix as variables, and the same name as the task file, so a tag, a variable prefix, and the `task_file |` prefix in the output all point to the same place.
+
+```yaml
+# playbooks/webservers.yml
+roles:
+  - role: nginx
+    tags: nginx
+```
+
+```yaml
+# roles/nginx/tasks/main.yml
+---
+- name: main | Install software
+  ansible.builtin.import_tasks: install_software.yml
+  tags: nginx__install_software
+
+- name: main | Configure nginx
+  ansible.builtin.import_tasks: configure.yml
+  tags: nginx__configure
+```
+
+**Why role-prefixed task file tags:** tags are combined with OR, not AND. `--tags nginx,configure` runs *all* of nginx plus *every* role's `configure` tasks, not just nginx's config. A tag like `nginx__configure` targets exactly one thing.
+
+### How tags are inherited
+
+This is the most common source of tag bugs:
+
+| Applied to | Do tasks inside get the tag? |
+|---|---|
+| `roles:` entry in a play | Yes, every task in the role |
+| `import_tasks` / `import_role` / `import_playbook` | Yes, every task inside |
+| `block` | Yes, every task in the block |
+| `include_tasks` / `include_role` | **No.** Only the include statement itself is tagged |
+
+To pass tags through a dynamic include, use `apply`:
+
+```yaml
+- name: main | Configure OS-specific settings
+  ansible.builtin.include_tasks:
+    file: "{{ ansible_facts['os_family'] | lower }}.yml"
+    apply:
+      tags: nginx__configure
+  tags: nginx__configure   # Needed too, so the include itself runs
+```
+
+### Special tags
+
+| Tag | Behaviour | Use for |
+|---|---|---|
+| `always` | Runs on every run, unless `--skip-tags always` is used | Asserts, load balancer drain/enable, loading variables, facts or registered values other tasks depend on |
+| `never` | Never runs unless asked for by another tag on the same task | Dangerous or occasional tasks: wiping data, forced reinstalls, debug output |
+
+```yaml
+- name: maintenance | Remove all cached data
+  ansible.builtin.file:
+    path: /var/cache/nginx
+    state: absent
+  tags:
+    - never
+    - nginx__clear_cache   # Runs only with --tags nginx__clear_cache
+```
+
+### Tagging guidelines
+
+- **A full run with no tags must always work.** Tags are a shortcut, never a requirement.
+- **Tag at the role and import level, not on every task.** Tagging each task by hand is noisy and quickly becomes inconsistent.
+- **Watch for hidden dependencies.** If a tagged task uses a variable registered by an untagged task, a partial run will fail or behave wrongly. Tag the task it depends on as well, or with `always`.
+- **Tag safety steps in `pre_tasks` / `post_tasks` with `always`** (see [Pre-tasks and post-tasks](#pre-tasks-and-post-tasks)).
+- **Use lowercase `snake_case`**. No spaces, hyphens or capitals.
+- **List a role's tags in its `README.md`** so people know what partial runs are possible.
+- **Check before running** with `--list-tags` and `--list-tasks`, especially against production.
+
+---
+
+## 10. Idempotency
 
 Idempotency means running the same playbook repeatedly produces the same end state, and reports **no changes** after the first successful run.
 
@@ -534,7 +723,7 @@ Idempotency means running the same playbook repeatedly produces the same end sta
 
 ---
 
-## 10. Templates and Files
+## 11. Templates and Files
 
 - Use **`templates/`** (with `.j2` extension) for files that contain variables; **`files/`** for static content.
 - **Add a managed-by header** to templated files so people don't edit them by hand:
@@ -570,7 +759,7 @@ events {
 
 ---
 
-## 11. Handlers
+## 12. Handlers
 
 Handlers run once at the end of a play, only when notified — ideal for restarts and reloads.
 
@@ -595,7 +784,7 @@ Handlers run once at the end of a play, only when notified — ideal for restart
 
 ---
 
-## 12. Secrets Management
+## 13. Secrets Management
 
 **Never commit plaintext secrets to version control.**
 
@@ -634,7 +823,7 @@ db_password: "{{ vault_db_password }}"
 
 ---
 
-## 13. Collections and Dependencies
+## 14. Collections and Dependencies
 
 - **Declare all dependencies** in `requirements.yml` and **pin versions** for reproducible builds:
 
@@ -660,7 +849,7 @@ ansible-galaxy install -r requirements.yml
 
 ---
 
-## 14. Error Handling
+## 15. Error Handling
 
 Use `block` / `rescue` / `always` for structured error handling:
 
@@ -705,7 +894,7 @@ Use `block` / `rescue` / `always` for structured error handling:
 
 ---
 
-## 15. Performance
+## 16. Performance
 
 - **Enable SSH pipelining** (`pipelining = True`) — large speed improvement.
 - **Increase `forks`** for large inventories.
@@ -718,7 +907,7 @@ Use `block` / `rescue` / `always` for structured error handling:
 
 ---
 
-## 16. Testing and Linting
+## 17. Testing and Linting
 
 Untested automation is a liability. Build quality checks into your workflow.
 
@@ -770,7 +959,7 @@ molecule test   # create → converge → idempotence → verify → destroy
 
 ---
 
-## 17. Version Control and CI/CD
+## 18. Version Control and CI/CD
 
 - **Everything in Git** — playbooks, roles, inventories, and configuration.
 - **Use a `.gitignore`** for `*.retry`, `collections/`, `.cache/`, vault password files, and local overrides.
@@ -783,7 +972,7 @@ molecule test   # create → converge → idempotence → verify → destroy
 
 ---
 
-## 18. Documentation
+## 19. Documentation
 
 - **Every role gets a `README.md`** covering:
   - What the role does
@@ -809,7 +998,7 @@ molecule test   # create → converge → idempotence → verify → destroy
 
 ---
 
-## 19. Quick Reference Checklist
+## 20. Quick Reference Checklist
 
 Use this during code review.
 
@@ -818,6 +1007,14 @@ Use this during code review.
 - [ ] Separate inventories per environment
 - [ ] Playbooks are thin; logic lives in roles
 - [ ] Each role has a single responsibility
+- [ ] Play-level setup/teardown (asserts, load balancer, smoke tests) is in `pre_tasks` / `post_tasks`, not inside roles
+
+### Tags
+- [ ] Roles tagged with their name in the playbook; task file imports tagged `role_name__task_file`
+- [ ] Tags passed through `include_*` with `apply`
+- [ ] Safety steps in pre/post tasks tagged `always`
+- [ ] Destructive or occasional tasks tagged `never`
+- [ ] Playbook still works with no tags
 
 ### Readability
 - [ ] Every play, task, and handler has a descriptive name
